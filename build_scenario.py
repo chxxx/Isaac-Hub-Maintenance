@@ -1,5 +1,8 @@
 import debugpy
 import os
+import random
+import numpy as np
+from omni.isaac.kit import SimulationApp
 
 # ==========================================
 # 0. 调试器配置
@@ -7,15 +10,14 @@ import os
 try:
     debugpy.listen(('localhost', 5678))
     print("【等待 VS Code 附加调试器...】请在 VS Code 按 F5")
-    # debugpy.wait_for_client() # 调试时取消注释此行
+    debugpy.wait_for_client() # 调试时取消注释此行
 except Exception as e:
     print(f"调试器监听跳过: {e}")
 
 # ==========================================
 # 1. 启动 SimulationApp
 # ==========================================
-from omni.isaac.kit import SimulationApp
-# 开启抗锯齿，让视觉效果更好
+# 开启 anti_aliasing 以获得更好的视觉边缘
 simulation_app = SimulationApp({"headless": False, "anti_aliasing": 1})
 
 # ==========================================
@@ -25,151 +27,171 @@ import omni.usd
 import omni.isaac.core.utils.prims as prim_utils
 from omni.isaac.core.world import World
 from omni.isaac.core.prims import XFormPrim
-# 引入 Robot 类，为未来控制做准备
-from omni.isaac.core.robots import Robot 
 from pxr import Usd, UsdGeom, UsdPhysics, PhysxSchema, Gf, Sdf
 import omni.kit.commands
 
 # ==========================================
-# 场景构建函数
+# 3. 场景构建函数
 # ==========================================
 
 def create_environment():
     print("Creating Environment (Solid Ground)...")
-    # 【视觉修正】实体地面，厚度 2cm，中心下移 1cm => 表面在 Z=0
+    # 视觉修正：实体地面，厚度 2cm，表面在 Z=0
     ground_path = "/World/Ground"
     prim_utils.create_prim(ground_path, "Cube", 
                            translation=(0, 0, -0.01), 
                            scale=(10, 10, 0.02))
     
-    # 【物理修正】添加碰撞
+    # 物理修正：添加碰撞 API
     stage = omni.usd.get_context().get_stage()
     ground_prim = stage.GetPrimAtPath(ground_path)
     UsdPhysics.CollisionAPI.Apply(ground_prim)
     
-    # 调暗一点环境光，让物体更有质感
+    # 环境灯光
     if not stage.GetPrimAtPath("/World/DomeLight"):
         light_prim = stage.DefinePrim("/World/DomeLight", "DomeLight")
-        light_prim.CreateAttribute("intensity", Sdf.ValueTypeNames.Float).Set(800.0)
+        light_prim.CreateAttribute("intensity", Sdf.ValueTypeNames.Float).Set(1000.0)
 
-def create_cabinets():
-    print("Creating Cabinets with clearance...")
-    # 【Z-Fighting 修正】所有放在地上的物体，Z 坐标抬高 5mm (0.005)
+def create_cabinets_and_random_bin():
+    print("Creating Cabinets and Randomized TrashBin...")
+    # 抬高 5mm 以消除 Z-Fighting 视觉闪烁
+    # 机柜 A (3.0, 3.0)
+    prim_utils.create_prim("/World/Cabinet_A", "Cube", translation=(3.0, 3.0, 1.005), scale=(0.6, 0.6, 2.0))
+    # 机柜 B (-3.0, 3.0)
+    prim_utils.create_prim("/World/Cabinet_B", "Cube", translation=(-3.0, 3.0, 1.005), scale=(0.6, 0.6, 2.0))
     
-    # 机柜 A (高 2.0 -> 半高 1.0 -> Z=1.005)
-    prim_utils.create_prim("/World/Cabinet_A", "Cube", 
-                           translation=(3.0, 3.0, 1.005), 
-                           scale=(0.6, 0.6, 2.0))
+    # 【随机任务逻辑】：废料桶位置三选一
+    candidate_locations = [
+        (0.0, -2.0, 0.255),  # 原位
+        (-2.5, 0.0, 0.255),  # 侧方 A
+        (2.5, 0.0, 0.255)    # 侧方 B
+    ]
+    chosen_pos = random.choice(candidate_locations)
     
-    # 机柜 B
-    prim_utils.create_prim("/World/Cabinet_B", "Cube", 
-                           translation=(-3.0, 3.0, 1.005), 
-                           scale=(0.6, 0.6, 2.0))
+    # 创建废料桶
+    bin_path = "/World/TrashBin"
+    prim_utils.create_prim(bin_path, "Cube", translation=chosen_pos, scale=(0.5, 0.5, 0.5))
     
-    # 垃圾桶
-    prim_utils.create_prim("/World/TrashBin", "Cube", 
-                           translation=(0.0, -2.0, 0.255), 
-                           scale=(0.5, 0.5, 0.5))
+    # 为废料桶设置黄色，便于识别
+    omni.kit.commands.execute("ChangeProperty", prop_path=f"{bin_path}.primvars:displayColor", 
+                             value=Gf.Vec3f(1.0, 1.0, 0.0), prev=None)
+    
+    print(f"TrashBin randomized to: {chosen_pos}")
+    return chosen_pos
 
 def create_deformable_rag(stage, prim_path, position):
-    print(f"Creating Deformable Rag at {prim_path}...")
+    print(f"Creating Deformable Rag (Soft Object) at {prim_path}...")
+    # 创建带网格的 Cube
     omni.kit.commands.execute("CreateMeshPrimWithDefaultXform", prim_type="Cube", prim_path=prim_path)
     
     prim = stage.GetPrimAtPath(prim_path)
     rag_prim = XFormPrim(prim_path)
     rag_prim.set_world_pose(position=position)
-    # 抹布尺寸
-    rag_prim.set_local_scale((0.4, 0.4, 0.01)) 
+    rag_prim.set_local_scale((0.4, 0.4, 0.01)) # 抹布形状
 
-    # 应用物理 API
+    # 应用 Deformable 物理 API
     UsdPhysics.CollisionAPI.Apply(prim)
     UsdPhysics.MeshCollisionAPI.Apply(prim)
     PhysxSchema.PhysxDeformableBodyAPI.Apply(prim)
 
-    # 【底层属性注入】确保参数生效
+    # 属性注入（确保 GPU 仿真精细度）
     prim.CreateAttribute("physxDeformable:simulationResolution", Sdf.ValueTypeNames.Int).Set(20)
     prim.CreateAttribute("physxDeformable:collisionSimplification", Sdf.ValueTypeNames.Bool).Set(False)
-    prim.CreateAttribute("physxDeformable:youngsModulus", Sdf.ValueTypeNames.Float).Set(10000.0)
-    prim.CreateAttribute("physxDeformable:damping", Sdf.ValueTypeNames.Float).Set(0.5)
+    prim.CreateAttribute("physxDeformable:youngsModulus", Sdf.ValueTypeNames.Float).Set(8000.0) # 较软
+    prim.CreateAttribute("physxDeformable:damping", Sdf.ValueTypeNames.Float).Set(0.4)
 
 def load_robot(usd_path):
-    print(f"Attempting to load robot from: {usd_path}")
-    
-    # 1. 路径校验 (Isaac Sim 对路径非常敏感)
+    print(f"Loading Lite3 Robot from: {usd_path}")
     if not os.path.exists(usd_path):
-        print(f"❌ 路径不存在: {usd_path}")
-        prim_utils.create_prim("/World/Lite3_Mock", "Cube", translation=(0, 0, 0.5), scale=(0.4, 0.2, 0.2))
+        print(f"❌ Error: Robot USD not found at {usd_path}. Falling back to Mock.")
+        prim_utils.create_prim("/World/Lite3", "Cube", translation=(0, 0, 0.3), scale=(0.4, 0.3, 0.2))
         return
 
-    # 2. 【关键修正】使用引用（References）方式加载
-    # 很多时候直接 create_prim 会因为层级关系导致模型不可见
     stage = omni.usd.get_context().get_stage()
     robot_prim_path = "/World/Lite3"
     
-    # 如果已存在则先删除，防止重复加载导致的冲突
-    if stage.GetPrimAtPath(robot_prim_path):
-        stage.RemovePrim(robot_prim_path)
-
-    # 创建一个 Xform 节点作为容器
+    # 使用 Reference 引用加载
     robot_prim = stage.DefinePrim(robot_prim_path, "Xform")
-    # 将外部 USD 引用进来
     robot_prim.GetReferences().AddReference(usd_path)
     
-    # 3. 设置坐标
-    # 注意：有的 Lite3 USD 模型单位是厘米(cm)，如果是那样，Z=0.45 就在地板里
-    # 我们先设高一点 (1.0m)，并重置缩放
-    from omni.isaac.core.prims import GeometryPrim
-    xform_robot = XFormPrim(robot_prim_path)
-    xform_robot.set_world_pose(position=(0.0, 0.0, 1.0))
-    xform_robot.set_local_scale((1.0, 1.0, 1.0)) # 强制 1:1 缩放，防止模型太小看不见
-
-    print(f"✅ Robot loaded at {robot_prim_path}. If still invisible, check 'F' key in Viewport.")
+    # 强制可见性并设置初始位姿
+    imageable = UsdGeom.Imageable(robot_prim)
+    if imageable: imageable.MakeVisible()
+    
+    # 放置在原点上方，利用物理落到地面
+    XFormPrim(robot_prim_path).set_world_pose(position=(0.0, 0.0, 1.0))
 
 # ==========================================
-# 主运行逻辑
+# 4. 主运行逻辑
 # ==========================================
 
 def main():
     world = World(stage_units_in_meters=1.0)
     stage = omni.usd.get_context().get_stage()
 
-    # ========================================================
-    # 【GPU 物理强制开启】(解决 Deformable 报错的唯一真理)
-    # ========================================================
-    scene_path = "/physicsScene"
-    scene_prim = stage.GetPrimAtPath(scene_path)
+    # --- 关键：配置 GPU 物理场景 ---
+    scene_prim = stage.GetPrimAtPath("/physicsScene")
     if not scene_prim:
-        scene_prim = stage.DefinePrim(scene_path, "PhysicsScene")
+        scene_prim = stage.DefinePrim("/physicsScene", "PhysicsScene")
     
     scene_prim.CreateAttribute("physxScene:enableGPUDynamics", Sdf.ValueTypeNames.Bool).Set(True)
-    scene_prim.CreateAttribute("physxScene:enableGPUPostSolver", Sdf.ValueTypeNames.Bool).Set(True)
     scene_prim.CreateAttribute("physxScene:broadphaseType", Sdf.ValueTypeNames.Token).Set("GPU")
-    
     scene_prim.CreateAttribute("physics:gravityDirection", Sdf.ValueTypeNames.Vector3f).Set(Gf.Vec3f(0.0, 0.0, -1.0))
     scene_prim.CreateAttribute("physics:gravityMagnitude", Sdf.ValueTypeNames.Float).Set(9.81)
-    
-    print(">>> Physics Scene Forced to GPU Mode <<<")
 
-    # 构建环境
+    # --- 构建场景 ---
     create_environment()
-    create_cabinets()
+    trash_bin_pos = create_cabinets_and_random_bin()
+    
+    # 在机柜 A 前放置抹布 (Z=0.5 掉落效果)
+    create_deformable_rag(stage, "/World/Rag", position=(2.3, 3.0, 0.5))
 
-    # 放置抹布 (Cabinet A 前方)
-    # 计算：3.0(中心) - 0.3(柜宽) - 0.4(距离) = 2.3
-    create_deformable_rag(stage, "/World/Rag", position=(2.3, 3.0, 0.8))
-
-    # 【加载 Lite3 机器人】
-    # 假设 usd 文件在脚本同级目录，如果不是，请修改这里的路径
-    # 比如: "C:/Assets/Lite3/Lite3_robot.usd"
-    robot_path = os.path.abspath("D:/study/usd/deep_robotics_model/Lite3/Lite3_usd/Lite3.usd") 
+    # 加载机器人
+    robot_path = "D:/study/usd/deep_robotics_model/Lite3/Lite3_usd/Lite3.usd"
     load_robot(robot_path)
 
-    # 运行
+    # --- 启动仿真 ---
     world.reset()
-    print("Simulation starting... Watch Lite3 drop and the Rag deform.")
+    
+    # 任务状态机
+    # 0: 观测, 1: 移动到抹布, 2: 抓取, 3: 移动到桶, 4: 投放
+    state = 0
+    counter = 0
+
+    print(">>> Logic Loop Started: Randomized Trashbin Task <<<")
     
     while simulation_app.is_running():
         world.step(render=True)
+        counter += 1
+
+        # 简单的任务逻辑演示（基于步数的状态切换）
+        if counter % 100 == 0:
+            # 获取抹布实时位置
+            rag_pos, _ = XFormPrim("/World/Rag").get_world_pose()
+
+            if state == 0 and counter > 200:
+                print(f"[感知] 识别到抹布位置: {rag_pos}")
+                state = 1
+            
+            elif state == 1:
+                print(f"[动作] Lite3 机器人正在向机柜 A 移动...")
+                state = 2
+            
+            elif state == 2:
+                print(f"[动作] 已接触柔性体，正在执行抓取...")
+                state = 3
+            
+            elif state == 3:
+                print(f"[动作] 搬运中... 目标废料桶位置: {trash_bin_pos}")
+                # 模拟抓取：将抹布附着到机器人或直接移动到桶上方
+                XFormPrim("/World/Rag").set_world_pose(
+                    position=(trash_bin_pos[0], trash_bin_pos[1], trash_bin_pos[2] + 0.6)
+                )
+                state = 4
+            
+            elif state == 4:
+                print("[任务] 抹布已放入废料桶！任务成功完成。")
+                state = 5
 
     simulation_app.close()
 
